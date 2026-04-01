@@ -27,7 +27,7 @@ from ..base import (
     DocStatus,
     DocStatusStorage,
 )
-from ..utils import logger, compute_mdhash_id
+from ..utils import logger, compute_mdhash_id, _cooperative_yield
 from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 from ..constants import GRAPH_FIELD_SEP
 from ..kg.shared_storage import get_data_init_lock
@@ -366,7 +366,7 @@ class OpenSearchKVStorage(BaseKVStorage):
         )
         current_time = int(time.time())
         actions = []
-        for doc_id, doc_data in data.items():
+        for i, (doc_id, doc_data) in enumerate(data.items(), start=1):
             doc_data["update_time"] = current_time
             doc_data.setdefault("create_time", current_time)
             actions.append(
@@ -377,6 +377,7 @@ class OpenSearchKVStorage(BaseKVStorage):
                     "_source": {k: v for k, v in doc_data.items() if k != "_id"},
                 }
             )
+            await _cooperative_yield(i)
         try:
             # No per-operation refresh: immediate reads use ID-based mget (translog),
             # search visibility is guaranteed after index_done_callback() batch refresh.
@@ -629,7 +630,7 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
         await self._ensure_index_ready()
         logger.debug(f"[{self.workspace}] Upserting {len(data)} doc statuses")
         actions = []
-        for k, v in data.items():
+        for i, (k, v) in enumerate(data.items(), start=1):
             v.setdefault("chunks_list", [])
             actions.append(
                 {
@@ -639,6 +640,7 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
                     "_source": {fk: fv for fk, fv in v.items() if fk != "_id"},
                 }
             )
+            await _cooperative_yield(i)
         try:
             # DocStatus needs refresh="wait_for" because get_docs_by_status
             # (search-based) is called immediately after enqueue upserts.
@@ -722,7 +724,21 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
         self, status: DocStatus
     ) -> dict[str, DocProcessingStatus]:
         """Get all documents matching a specific processing status."""
-        return await self._search_all_docs({"term": {"status": status.value}})
+        return await self.get_docs_by_statuses([status])
+
+    async def get_docs_by_statuses(
+        self, statuses: list[DocStatus]
+    ) -> dict[str, DocProcessingStatus]:
+        """Get all documents matching any of the given statuses in a single query.
+
+        Uses OpenSearch's terms query (multi-value equivalent of term) to fetch
+        all matching statuses in one PIT + search_after pass instead of one
+        full scan per status.
+        """
+        if not statuses:
+            return {}
+        status_values = [s.value for s in statuses]
+        return await self._search_all_docs({"terms": {"status": status_values}})
 
     async def get_docs_by_track_id(
         self, track_id: str
@@ -2475,14 +2491,16 @@ class OpenSearchVectorDBStorage(BaseVectorStorage):
         )
         current_time = int(time.time())
 
-        list_data = [
-            {
-                "_id": k,
-                "created_at": current_time,
-                **{k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields},
-            }
-            for k, v in data.items()
-        ]
+        list_data = []
+        for i, (k, v) in enumerate(data.items(), start=1):
+            list_data.append(
+                {
+                    "_id": k,
+                    "created_at": current_time,
+                    **{k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields},
+                }
+            )
+            await _cooperative_yield(i)
         contents = [v["content"] for v in data.values()]
 
         batches = [
@@ -2493,19 +2511,24 @@ class OpenSearchVectorDBStorage(BaseVectorStorage):
             *[self.embedding_func(batch) for batch in batches]
         )
         embeddings = np.concatenate(embeddings_list)
+        assert len(embeddings) == len(
+            list_data
+        ), f"Embedding count mismatch: expected {len(list_data)}, got {len(embeddings)}"
+        for i, doc in enumerate(list_data, start=1):
+            doc["vector"] = embeddings[i - 1].tolist()
+            await _cooperative_yield(i)
 
-        for i, doc in enumerate(list_data):
-            doc["vector"] = embeddings[i].tolist()
-
-        actions = [
-            {
-                "_op_type": "index",
-                "_index": self._index_name,
-                "_id": doc["_id"],
-                "_source": {k: v for k, v in doc.items() if k != "_id"},
-            }
-            for doc in list_data
-        ]
+        actions = []
+        for i, doc in enumerate(list_data, start=1):
+            actions.append(
+                {
+                    "_op_type": "index",
+                    "_index": self._index_name,
+                    "_id": doc["_id"],
+                    "_source": {k: v for k, v in doc.items() if k != "_id"},
+                }
+            )
+            await _cooperative_yield(i)
         try:
             # No per-operation refresh: immediate reads use ID-based mget (translog),
             # k-NN search visibility is guaranteed after index_done_callback() batch refresh.

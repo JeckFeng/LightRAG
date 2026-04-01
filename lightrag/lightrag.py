@@ -126,6 +126,7 @@ config = configparser.ConfigParser()
 config.read("config.ini", "utf-8")
 
 
+# FXL从文件处理状态中获取chunklist
 def _chunk_fields_from_status_doc(
     status_doc: "DocProcessingStatus",
 ) -> tuple[list[str], int]:
@@ -147,7 +148,46 @@ def _chunk_fields_from_status_doc(
 
     return chunks_list, len(chunks_list)
 
+# FXL文件路径处理
+def _resolve_doc_file_path(
+    status_doc: "DocProcessingStatus" | None = None,
+    content_data: dict[str, Any] | None = None,
+) -> str:
+    """Resolve the best available document file path.
 
+    Prefer a non-placeholder path from doc_status, then fall back to full_docs.
+    This avoids overwriting historical file paths with placeholder values during
+    retries or early-cancellation paths.
+    """
+
+    placeholder_paths = {"", "no-file-path", "unknown_source"}
+
+    def _normalize_path(candidate: Any) -> str | None:
+        if not isinstance(candidate, str):
+            return None
+
+        normalized = candidate.strip()
+        if not normalized:
+            return None
+
+        return normalized
+
+    candidates = [
+        _normalize_path(getattr(status_doc, "file_path", None)),
+        _normalize_path(content_data.get("file_path") if content_data else None),
+    ]
+
+    for candidate in candidates:
+        if candidate and candidate not in placeholder_paths:
+            return candidate
+
+    for candidate in candidates:
+        if candidate:
+            return "unknown_source" if candidate == "no-file-path" else candidate
+
+    return "unknown_source"
+
+# FXL处理raw_values，返回一个非空文本列表
 def _normalize_string_list(raw_values: Any, context: str = "") -> list[str]:
     """Return a list of non-empty strings from raw_values.
 
@@ -209,7 +249,7 @@ class LightRAG:
 
     # Query parameters
     # ---
-
+    # FXL每个问题检索的实体和关系的数量
     top_k: int = field(default=get_env_value("TOP_K", DEFAULT_TOP_K, int))
     """Number of entities/relations to retrieve for each query."""
 
@@ -250,7 +290,7 @@ class LightRAG:
 
     # Entity extraction
     # ---
-
+    # FXL针对含糊内容的实体提取尝试次数上限。
     entity_extract_max_gleaning: int = field(
         default=get_env_value("MAX_GLEANING", DEFAULT_MAX_GLEANING, int)
     )
@@ -263,6 +303,7 @@ class LightRAG:
     )
     """Maximum tokens allowed for entity extraction input context."""
 
+    # FXL在实体/关系合并时触发 LLM 摘要所需的摘要片段或令牌数量
     force_llm_summary_on_merge: int = field(
         default=get_env_value(
             "FORCE_LLM_SUMMARY_ON_MERGE", DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE, int
@@ -807,6 +848,7 @@ class LightRAG:
 
             self._storages_status = StoragesStatus.FINALIZED
 
+    # FXL检查kg的实体和关系是否需要合并
     async def check_and_migrate_data(self):
         """Check if data migration is needed and perform migration if necessary"""
         async with get_data_init_lock():
@@ -877,6 +919,7 @@ class LightRAG:
                 logger.error(f"Error in data migration check: {e}")
                 raise e
 
+    # FXL合并数据
     async def _migrate_entity_relation_data(self, processed_docs: dict):
         """Migrate existing entity and relation data to full_entities and full_relations storage"""
         logger.info(f"Starting data migration for {len(processed_docs)} documents")
@@ -1306,6 +1349,7 @@ class LightRAG:
             if update_storage:
                 await self._insert_done()
 
+    # FXL文档处理流程
     async def apipeline_enqueue_documents(
         self,
         input: str | list[str],
@@ -1616,9 +1660,7 @@ class LightRAG:
             for doc_id in inconsistent_docs:
                 try:
                     status_doc = to_process_docs[doc_id]
-                    file_path = (
-                        getattr(status_doc, "file_path", None) or "unknown_source"
-                    )
+                    file_path = _resolve_doc_file_path(status_doc=status_doc)
 
                     # Delete doc_status entry
                     await self.doc_status.delete([doc_id])
@@ -1667,6 +1709,10 @@ class LightRAG:
                     preserved_chunks_list, preserved_chunks_count = (
                         _chunk_fields_from_status_doc(status_doc)
                     )
+                    resolved_file_path = _resolve_doc_file_path(
+                        status_doc=status_doc,
+                        content_data=content_data,
+                    )
                     # Prepare document for status reset to PENDING
                     docs_to_reset[doc_id] = {
                         "status": DocStatus.PENDING,
@@ -1676,8 +1722,7 @@ class LightRAG:
                         "chunks_list": preserved_chunks_list,
                         "created_at": status_doc.created_at,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
-                        "file_path": getattr(status_doc, "file_path", None)
-                        or "unknown_source",
+                        "file_path": resolved_file_path,
                         "track_id": getattr(status_doc, "track_id", ""),
                         # Clear any error messages and processing metadata
                         "error_msg": "",
@@ -1686,6 +1731,7 @@ class LightRAG:
 
                     # Update the status in to_process_docs as well
                     status_doc.status = DocStatus.PENDING
+                    status_doc.file_path = resolved_file_path
                     reset_count += 1
 
         # Update doc_status storage if there are documents to reset
@@ -1729,16 +1775,11 @@ class LightRAG:
         async with pipeline_status_lock:
             # Ensure only one worker is processing documents
             if not pipeline_status.get("busy", False):
-                processing_docs, failed_docs, pending_docs = await asyncio.gather(
-                    self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
-                    self.doc_status.get_docs_by_status(DocStatus.FAILED),
-                    self.doc_status.get_docs_by_status(DocStatus.PENDING),
+                to_process_docs: dict[
+                    str, DocProcessingStatus
+                ] = await self.doc_status.get_docs_by_statuses(
+                    [DocStatus.PROCESSING, DocStatus.FAILED, DocStatus.PENDING]
                 )
-
-                to_process_docs: dict[str, DocProcessingStatus] = {}
-                to_process_docs.update(processing_docs)
-                to_process_docs.update(failed_docs)
-                to_process_docs.update(pending_docs)
 
                 if not to_process_docs:
                     logger.info("No documents to process")
@@ -1849,13 +1890,14 @@ class LightRAG:
                 ) -> None:
                     """Process single document"""
                     # Initialize variables at the start to prevent UnboundLocalError in error handling
-                    file_path = "unknown_source"
+                    file_path = _resolve_doc_file_path(status_doc=status_doc)
                     current_file_number = 0
                     file_extraction_stage_ok = False
                     processing_start_time = int(time.time())
                     first_stage_tasks = []
                     entity_relation_task = None
                     chunks: dict[str, Any] = {}
+                    content_data: dict[str, Any] | None = None
 
                     def get_failed_chunk_snapshot() -> tuple[list[str], int]:
                         if chunks:
@@ -1869,16 +1911,23 @@ class LightRAG:
                         first_stage_tasks = []
                         entity_relation_task = None
                         try:
-                            # Check for cancellation before starting document processing
+                            # Resolve file_path from full_docs before honoring a queued
+                            # cancellation so corrupted doc_status placeholders do not
+                            # get written back again during retry/cancel flows.
+                            content_data = await self.full_docs.get_by_id(doc_id)
+                            if content_data:
+                                file_path = _resolve_doc_file_path(
+                                    status_doc=status_doc,
+                                    content_data=content_data,
+                                )
+                                status_doc.file_path = file_path
+
+                            # Check for cancellation before starting document processing.
+                            # file_path is resolved before this check so queued documents
+                            # do not lose their source path on early cancellation.
                             async with pipeline_status_lock:
                                 if pipeline_status.get("cancellation_requested", False):
                                     raise PipelineCancelledException("User cancelled")
-
-                            # Get file path from status document
-                            file_path = (
-                                getattr(status_doc, "file_path", None)
-                                or "unknown_source"
-                            )
 
                             async with pipeline_status_lock:
                                 # Update processed file count and save current file number
@@ -1906,7 +1955,6 @@ class LightRAG:
                                     )
 
                             # Get document content from full_docs
-                            content_data = await self.full_docs.get_by_id(doc_id)
                             if not content_data:
                                 raise Exception(
                                     f"Document content not found in full_docs for doc_id: {doc_id}"
@@ -2200,7 +2248,9 @@ class LightRAG:
                                             "content_summary": status_doc.content_summary,
                                             "content_length": status_doc.content_length,
                                             "created_at": status_doc.created_at,
-                                            "updated_at": datetime.now().isoformat(),
+                                            "updated_at": datetime.now(
+                                                timezone.utc
+                                            ).isoformat(),
                                             "file_path": file_path,
                                             "track_id": status_doc.track_id,  # Preserve existing track_id
                                             "metadata": {
@@ -2258,16 +2308,9 @@ class LightRAG:
                 pipeline_status["history_messages"].append(log_message)
 
                 # Check for pending documents again
-                processing_docs, failed_docs, pending_docs = await asyncio.gather(
-                    self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
-                    self.doc_status.get_docs_by_status(DocStatus.FAILED),
-                    self.doc_status.get_docs_by_status(DocStatus.PENDING),
+                to_process_docs = await self.doc_status.get_docs_by_statuses(
+                    [DocStatus.PROCESSING, DocStatus.FAILED, DocStatus.PENDING]
                 )
-
-                to_process_docs = {}
-                to_process_docs.update(processing_docs)
-                to_process_docs.update(failed_docs)
-                to_process_docs.update(pending_docs)
 
         finally:
             log_message = "Enqueued document processing pipeline stopped"
@@ -2281,6 +2324,7 @@ class LightRAG:
                 pipeline_status["latest_message"] = log_message
                 pipeline_status["history_messages"].append(log_message)
 
+    # FXL实体关系抽取流程
     async def _process_extract_entities(
         self, chunk: dict[str, Any], pipeline_status=None, pipeline_status_lock=None
     ) -> list:
@@ -2339,6 +2383,7 @@ class LightRAG:
         loop = always_get_an_event_loop()
         loop.run_until_complete(self.ainsert_custom_kg(custom_kg, full_doc_id))
 
+    # FXL实体向量的相关数据插入向量库以及知识图谱
     async def ainsert_custom_kg(
         self,
         custom_kg: dict[str, Any],
@@ -2513,7 +2558,7 @@ class LightRAG:
         finally:
             if update_storage:
                 await self._insert_done()
-
+    # FXL问题查询
     def query(
         self,
         query: str,

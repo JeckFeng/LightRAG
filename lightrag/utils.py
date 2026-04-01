@@ -236,6 +236,9 @@ if TYPE_CHECKING:
 load_dotenv(dotenv_path=".env", override=False)
 
 VERBOSE_DEBUG = os.getenv("VERBOSE", "false").lower() == "true"
+PERFORMANCE_TIMING_LOGS = (
+    os.getenv("LIGHTRAG_PERFORMANCE_TIMING_LOGS", "false").lower() == "true"
+)
 
 
 def verbose_debug(msg: str, *args, **kwargs):
@@ -269,6 +272,12 @@ def set_verbose_debug(enabled: bool):
     """Enable or disable verbose debug output"""
     global VERBOSE_DEBUG
     VERBOSE_DEBUG = enabled
+
+
+def performance_timing_log(msg: str, *args, **kwargs):
+    """Emit targeted performance timing logs only when explicitly enabled."""
+    if PERFORMANCE_TIMING_LOGS:
+        logger.info(msg, *args, **kwargs)
 
 
 statistic_data = {"llm_call": 0, "llm_cache": 0, "embed_call": 0}
@@ -1494,6 +1503,16 @@ def exists_func(obj, func_name: str) -> bool:
         return True
     else:
         return False
+
+
+async def _cooperative_yield(iteration: int, every: int = 64) -> None:
+    """Periodically yield control to the event loop during CPU-heavy async loops.
+
+    Call inside long synchronous-style loops to prevent event loop starvation
+    in single-worker deployments. Yields every `every` iterations.
+    """
+    if iteration > 0 and iteration % every == 0:
+        await asyncio.sleep(0)
 
 
 def always_get_an_event_loop() -> asyncio.AbstractEventLoop:
