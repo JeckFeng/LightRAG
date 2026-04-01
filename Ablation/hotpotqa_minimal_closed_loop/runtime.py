@@ -75,7 +75,8 @@ def build_mock_runtime_dependencies(
         await asyncio.sleep(0)
 
         if keyword_extraction:
-            low_level_keywords = _extract_keywords(prompt)
+            query_text = _extract_query_from_keyword_prompt(prompt)
+            low_level_keywords = _extract_keywords(query_text)
             high_level_keywords = low_level_keywords[:1]
             return json.dumps(
                 {
@@ -91,6 +92,13 @@ def build_mock_runtime_dependencies(
 
         if system_prompt and "expert AI assistant specializing in synthesizing" in system_prompt:
             return _build_mock_answer(prompt, system_prompt)
+
+        if (
+            system_prompt
+            and "Knowledge Graph Specialist responsible for extracting entities and relationships"
+            in system_prompt
+        ):
+            return _build_mock_extraction_response(prompt)
 
         if "Alpha System" in prompt:
             return (
@@ -153,6 +161,109 @@ def _extract_keywords(text: str) -> list[str]:
     return fallback_tokens[:3] or ["context"]
 
 
+def _extract_query_from_keyword_prompt(prompt: str) -> str:
+    match = re.search(r"User Query:\s*(.+?)\n\s*---Output---", prompt, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return prompt
+
+
+def _extract_input_text_from_prompt(prompt: str) -> str:
+    match = re.search(
+        r"---Data to be Processed---.*?<Input Text>\s*```(.*?)```",
+        prompt,
+        re.DOTALL,
+    )
+    if match:
+        return match.group(1).strip()
+    return prompt.strip()
+
+
+def _guess_entity_type(entity_name: str) -> str:
+    lowered = entity_name.lower()
+    if any(token in lowered for token in ("film", "series", "episode", "song", "album")):
+        return "Content"
+    if any(token in lowered for token in ("city", "country", "state", "province", "river")):
+        return "Location"
+    if any(
+        token in lowered
+        for token in (
+            "university",
+            "college",
+            "company",
+            "committee",
+            "government",
+            "department",
+            "ministry",
+            "studio",
+        )
+    ):
+        return "Organization"
+    words = [word for word in entity_name.replace("(", " ").replace(")", " ").split() if word]
+    if 1 <= len(words) <= 4 and all(word[:1].isupper() for word in words if word[0].isalnum()):
+        return "Person"
+    return "Concept"
+
+
+def _extract_candidate_entities(title: str, body: str) -> list[str]:
+    ordered: list[str] = []
+
+    def add(candidate: str) -> None:
+        normalized = re.sub(r"\s+", " ", candidate).strip(" ,.;:()[]")
+        if not normalized or len(normalized) < 3:
+            return
+        if normalized not in ordered:
+            ordered.append(normalized)
+
+    add(title)
+    for sentence in re.split(r"(?<=[.!?])\s+", body):
+        matches = re.findall(
+            r"\b[A-Z][A-Za-z0-9'&.-]*(?:\s+[A-Z][A-Za-z0-9'&.-]*){0,4}\b",
+            sentence,
+        )
+        for match in matches:
+            add(match)
+    return ordered[:6]
+
+
+def _build_mock_extraction_response(prompt: str) -> str:
+    input_text = _extract_input_text_from_prompt(prompt)
+    if not input_text:
+        return "<|COMPLETE|>"
+
+    lines = [line.strip() for line in input_text.splitlines() if line.strip()]
+    title = lines[0]
+    body = " ".join(lines[1:]) if len(lines) > 1 else lines[0]
+
+    entities = _extract_candidate_entities(title, body)
+    if not entities:
+        entities = [title]
+
+    records: list[str] = []
+    descriptions: dict[str, str] = {}
+    for entity_name in entities:
+        entity_type = _guess_entity_type(entity_name)
+        if entity_name == title:
+            description = f"{entity_name} is the main topic of the current paragraph."
+        else:
+            description = f"{entity_name} is mentioned in the current paragraph context."
+        descriptions[entity_name] = description
+        records.append(
+            f"entity<|#|>{entity_name}<|#|>{entity_type}<|#|>{description}"
+        )
+
+    related_entities = [entity for entity in entities if entity != title][:2]
+    for target_entity in related_entities:
+        records.append(
+            "relation<|#|>"
+            f"{title}<|#|>{target_entity}<|#|>paragraph context, mention<|#|>"
+            f"{title} is directly associated with {target_entity} in the current paragraph."
+        )
+
+    records.append("<|COMPLETE|>")
+    return "\n".join(records)
+
+
 def _extract_profile_entity_name(prompt: str) -> str:
     match = re.search(r"- entity_name:\s*(.+)", prompt)
     if match:
@@ -178,10 +289,123 @@ def _build_mock_answer(question: str, system_prompt: str) -> str:
     if "Alpha System" in question:
         return "Alpha System is a retrieval pipeline for evidence synthesis."
 
-    entity_keywords = _extract_keywords(system_prompt)
+    candidate_sentences = _extract_context_sentences(system_prompt)
+    best_sentence = _select_best_sentence(question, candidate_sentences)
+    if best_sentence:
+        extracted_answer = _extract_answer_span(question, best_sentence)
+        if extracted_answer:
+            return extracted_answer
+        return best_sentence
+
+    entity_keywords = _extract_keywords(_extract_context_text(system_prompt))
     if entity_keywords:
         return f"{entity_keywords[0]} appears in the retrieved context."
     return "No answer available."
+
+
+def _extract_context_text(system_prompt: str) -> str:
+    match = re.search(r"---Context---\s*(.*)", system_prompt, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return system_prompt
+
+
+def _extract_context_sentences(system_prompt: str) -> list[str]:
+    context_text = _extract_context_text(system_prompt)
+    sentences: list[str] = []
+    for line in context_text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{") or not stripped.endswith("}"):
+            continue
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        content = str(payload.get("content", "")).strip()
+        if not content:
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+", content):
+            normalized = sentence.strip()
+            if normalized:
+                sentences.append(normalized)
+    return sentences
+
+
+def _select_best_sentence(question: str, candidates: list[str]) -> str:
+    question_tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9'-]+", question)
+        if token.lower()
+        not in {
+            "what",
+            "which",
+            "who",
+            "when",
+            "where",
+            "why",
+            "how",
+            "the",
+            "a",
+            "an",
+            "was",
+            "were",
+            "is",
+            "did",
+            "does",
+            "do",
+            "of",
+            "in",
+            "to",
+            "by",
+            "and",
+        }
+    }
+    if not question_tokens:
+        return candidates[0] if candidates else ""
+
+    def score(sentence: str) -> tuple[int, int]:
+        sentence_tokens = {
+            token.lower()
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9'-]+", sentence)
+        }
+        overlap = len(question_tokens & sentence_tokens)
+        return overlap, len(sentence)
+
+    ranked = sorted(candidates, key=score, reverse=True)
+    return ranked[0] if ranked else ""
+
+
+def _extract_answer_span(question: str, sentence: str) -> str:
+    lowered_question = question.lower()
+
+    if "what government position" in lowered_question or "what position" in lowered_question:
+        patterns = (
+            r"served as (?:the )?([A-Z][A-Za-z]+(?: [A-Z][A-Za-z]+){0,4})",
+            r"was (?:the )?([A-Z][A-Za-z]+(?: [A-Z][A-Za-z]+){0,4})",
+            r"held (?:the position of )?([A-Z][A-Za-z]+(?: [A-Z][A-Za-z]+){0,4})",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, sentence)
+            if match:
+                return match.group(1).strip(" .")
+
+    if lowered_question.startswith("who "):
+        candidates = re.findall(
+            r"\b[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3}\b",
+            sentence,
+        )
+        if candidates:
+            return candidates[0]
+
+    if lowered_question.startswith("when "):
+        match = re.search(
+            r"\b(?:\d{4}|[A-Z][a-z]+ \d{1,2}, \d{4}|[A-Z][a-z]+ \d{4})\b",
+            sentence,
+        )
+        if match:
+            return match.group(0)
+
+    return ""
 
 
 def _load_symbol(spec: str) -> Callable[..., Any]:
