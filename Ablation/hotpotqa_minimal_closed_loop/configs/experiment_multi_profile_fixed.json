@@ -1,0 +1,8 @@
+{
+  "mode_id": "multi_profile_fixed",
+  "query_mode": "local",
+  "enable_entity_profiles": true,
+  "description_strategy": "fixed_multi_profile",
+  "requires_custom_ablation_adapter": true,
+  "notes": "This mode reuses offline profiles but does not perform query-conditioned selection."
+}

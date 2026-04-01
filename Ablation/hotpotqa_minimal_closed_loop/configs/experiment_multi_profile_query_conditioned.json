@@ -1,0 +1,9 @@
+{
+  "mode_id": "multi_profile_query_conditioned",
+  "query_mode": "local",
+  "enable_entity_profiles": true,
+  "entity_profile_top_k": 24,
+  "entity_profile_max_per_entity": 2,
+  "description_strategy": "query_conditioned_profile_selection",
+  "requires_custom_ablation_adapter": false
+}

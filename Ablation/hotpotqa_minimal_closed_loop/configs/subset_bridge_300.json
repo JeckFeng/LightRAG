@@ -1,0 +1,11 @@
+{
+  "subset_id": "bridge_300",
+  "dataset_path": "datasets/hotpotqa/hotpot_dev_distractor_v1.json",
+  "sample_filter": {
+    "type": "bridge"
+  },
+  "sample_limit": 300,
+  "shuffle": false,
+  "seed": 0,
+  "output_manifest": "Ablation/hotpotqa_minimal_closed_loop/manifests/bridge_300_case_manifest.jsonl"
+}
