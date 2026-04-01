@@ -3161,6 +3161,17 @@ def convert_to_user_format(
                     "entity_name": original_entity.get("entity_name", entity_name),
                     "entity_type": original_entity.get("entity_type", "UNKNOWN"),
                     "description": original_entity.get("description", ""),
+                    "base_description": original_entity.get(
+                        "base_description",
+                        original_entity.get("description", ""),
+                    ),
+                    "selected_profile_ids": original_entity.get(
+                        "selected_profile_ids", []
+                    ),
+                    "selected_facet_ids": original_entity.get(
+                        "selected_facet_ids", []
+                    ),
+                    "selected_profiles": original_entity.get("selected_profiles", []),
                     "source_id": original_entity.get("source_id", ""),
                     "file_path": original_entity.get("file_path", "unknown_source"),
                     "created_at": original_entity.get("created_at", ""),
@@ -3173,6 +3184,13 @@ def convert_to_user_format(
                     "entity_name": entity_name,
                     "entity_type": entity.get("type", "UNKNOWN"),
                     "description": entity.get("description", ""),
+                    "base_description": entity.get(
+                        "base_description",
+                        entity.get("description", ""),
+                    ),
+                    "selected_profile_ids": entity.get("selected_profile_ids", []),
+                    "selected_facet_ids": entity.get("selected_facet_ids", []),
+                    "selected_profiles": entity.get("selected_profiles", []),
                     "source_id": entity.get("source_id", ""),
                     "file_path": entity.get("file_path", "unknown_source"),
                     "created_at": entity.get("created_at", ""),

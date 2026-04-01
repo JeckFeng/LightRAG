@@ -2905,6 +2905,9 @@ class LightRAG:
             max_entity_tokens=param.max_entity_tokens,
             max_relation_tokens=param.max_relation_tokens,
             max_total_tokens=param.max_total_tokens,
+            enable_entity_profiles=param.enable_entity_profiles,
+            entity_profile_top_k=param.entity_profile_top_k,
+            entity_profile_max_per_entity=param.entity_profile_max_per_entity,
             hl_keywords=param.hl_keywords,
             ll_keywords=param.ll_keywords,
             conversation_history=param.conversation_history,
@@ -2929,6 +2932,8 @@ class LightRAG:
                 hashing_kv=self.llm_response_cache,
                 system_prompt=None,
                 chunks_vdb=self.chunks_vdb,
+                entity_profiles_storage=self.entity_profiles,
+                entity_profiles_vdb=self.entity_profiles_vdb,
             )
         elif data_param.mode == "naive":
             logger.debug(f"[aquery_data] Using naive_query for mode: {data_param.mode}")
@@ -3026,6 +3031,8 @@ class LightRAG:
                     hashing_kv=self.llm_response_cache,
                     system_prompt=system_prompt,
                     chunks_vdb=self.chunks_vdb,
+                    entity_profiles_storage=self.entity_profiles,
+                    entity_profiles_vdb=self.entity_profiles_vdb,
                 )
             elif param.mode == "naive":
                 query_result = await naive_query(

@@ -57,6 +57,7 @@ from lightrag.base import (
 from lightrag.prompt import PROMPTS
 from lightrag.constants import (
     GRAPH_FIELD_SEP,
+    DEFAULT_ENTITY_PROFILE_FACETS,
     DEFAULT_ENTITY_PROFILE_SCHEMA_ID,
     DEFAULT_ENTITY_PROFILE_SCHEMA_VERSION,
     DEFAULT_MAX_ENTITY_TOKENS,
@@ -711,6 +712,187 @@ async def _upsert_entity_profiles(
         await entity_profiles_vdb.delete(stale_profile_ids)
 
     return record
+
+
+def _compose_entity_profile_description(
+    selected_profiles: list[dict[str, Any]],
+    base_description: str,
+) -> str:
+    if not selected_profiles:
+        return base_description
+
+    default_facet_order = {
+        facet["facet_id"]: index
+        for index, facet in enumerate(DEFAULT_ENTITY_PROFILE_FACETS)
+    }
+
+    ordered_profiles = [
+        profile
+        for _, profile in sorted(
+            enumerate(selected_profiles),
+            key=lambda item: (
+                item[1].get(
+                    "_facet_order",
+                    default_facet_order.get(
+                        item[1].get("facet_id"), len(default_facet_order) + item[0]
+                    ),
+                ),
+                item[0],
+            ),
+        )
+    ]
+
+    composed_lines: list[str] = []
+    for profile in ordered_profiles:
+        profile_text = str(profile.get("profile_text", "")).strip()
+        if not profile_text:
+            continue
+
+        facet_id = str(profile.get("facet_id", "")).strip()
+        if facet_id:
+            composed_lines.append(f"[{facet_id}] {profile_text}")
+        else:
+            composed_lines.append(profile_text)
+
+    return "\n".join(composed_lines) if composed_lines else base_description
+
+
+async def _select_profiles_for_entities(
+    query: str,
+    node_datas: list[dict[str, Any]],
+    entity_profiles_storage: BaseKVStorage | None,
+    entity_profiles_vdb: BaseVectorStorage | None,
+    query_param: QueryParam,
+    query_embedding=None,
+) -> list[dict[str, Any]]:
+    if not node_datas:
+        return node_datas
+
+    updated_node_datas = [dict(node_data) for node_data in node_datas]
+    for node_data in updated_node_datas:
+        base_description = str(node_data.get("description", "") or "")
+        node_data["base_description"] = base_description
+        node_data["selected_profile_ids"] = []
+        node_data["selected_facet_ids"] = []
+        node_data["selected_profiles"] = []
+
+    if (
+        entity_profiles_storage is None
+        or entity_profiles_vdb is None
+        or query_param.entity_profile_top_k <= 0
+        or query_param.entity_profile_max_per_entity <= 0
+    ):
+        return updated_node_datas
+
+    entity_names = [
+        node_data["entity_name"]
+        for node_data in updated_node_datas
+        if node_data.get("entity_name")
+    ]
+    if not entity_names:
+        return updated_node_datas
+
+    recalled_entity_names = set(entity_names)
+    profile_results = await entity_profiles_vdb.query(
+        query,
+        top_k=query_param.entity_profile_top_k,
+        query_embedding=query_embedding,
+    )
+
+    selected_profile_ids_by_entity: dict[str, list[str]] = defaultdict(list)
+    selected_facet_ids_by_entity: dict[str, set[str]] = defaultdict(set)
+    for profile_result in profile_results:
+        entity_name = profile_result.get("entity_name")
+        profile_id = profile_result.get("profile_id") or profile_result.get("id")
+        facet_id = profile_result.get("facet_id")
+
+        if (
+            not entity_name
+            or entity_name not in recalled_entity_names
+            or not profile_id
+            or len(selected_profile_ids_by_entity[entity_name])
+            >= query_param.entity_profile_max_per_entity
+        ):
+            continue
+
+        if facet_id and facet_id in selected_facet_ids_by_entity[entity_name]:
+            continue
+
+        selected_profile_ids_by_entity[entity_name].append(profile_id)
+        if facet_id:
+            selected_facet_ids_by_entity[entity_name].add(facet_id)
+
+    profile_records = await entity_profiles_storage.get_by_ids(entity_names)
+    profile_records_by_entity: dict[str, EntityProfilesRecordSchema] = {}
+    for entity_name, profile_record in zip(entity_names, profile_records):
+        if profile_record is None:
+            continue
+        record_entity_name = profile_record.get("entity_name") or entity_name
+        profile_records_by_entity[record_entity_name] = profile_record
+
+    for node_data in updated_node_datas:
+        entity_name = node_data.get("entity_name")
+        if not entity_name:
+            continue
+
+        profile_record = profile_records_by_entity.get(entity_name)
+        if profile_record is None:
+            node_data["description"] = node_data["base_description"]
+            continue
+
+        base_description = str(
+            profile_record.get("base_description") or node_data["base_description"]
+        )
+        selected_profile_ids = selected_profile_ids_by_entity.get(entity_name, [])
+        selected_profile_id_set = set(selected_profile_ids)
+        seen_facet_ids: set[str] = set()
+        ordered_selected_profiles: list[EntityProfileSchema] = []
+
+        for profile in profile_record.get("profiles", []):
+            profile_id = profile.get("profile_id")
+            facet_id = profile.get("facet_id")
+            if (
+                not profile_id
+                or profile_id not in selected_profile_id_set
+                or (facet_id and facet_id in seen_facet_ids)
+            ):
+                continue
+            ordered_selected_profiles.append(dict(profile))
+            if facet_id:
+                seen_facet_ids.add(facet_id)
+            if len(ordered_selected_profiles) >= query_param.entity_profile_max_per_entity:
+                break
+
+        if selected_profile_id_set and not ordered_selected_profiles:
+            logger.warning(
+                "Selected entity profiles are missing from KV storage for `%s`; falling back to base description",
+                entity_name,
+            )
+
+        composable_profiles = [
+            {
+                **profile,
+                "_facet_order": profile_index,
+            }
+            for profile_index, profile in enumerate(ordered_selected_profiles)
+        ]
+
+        node_data["base_description"] = base_description
+        node_data["selected_profile_ids"] = [
+            profile["profile_id"] for profile in ordered_selected_profiles
+        ]
+        node_data["selected_facet_ids"] = [
+            profile["facet_id"]
+            for profile in ordered_selected_profiles
+            if profile.get("facet_id")
+        ]
+        node_data["selected_profiles"] = ordered_selected_profiles
+        node_data["description"] = _compose_entity_profile_description(
+            composable_profiles,
+            base_description,
+        )
+
+    return updated_node_datas
 
 
 def _handle_single_entity_extraction(
@@ -3539,6 +3721,8 @@ async def kg_query(
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
     chunks_vdb: BaseVectorStorage = None,
+    entity_profiles_storage: BaseKVStorage | None = None,
+    entity_profiles_vdb: BaseVectorStorage | None = None,
 ) -> QueryResult | None:
     """
     Execute knowledge graph query and return unified QueryResult object.
@@ -3613,6 +3797,8 @@ async def kg_query(
         text_chunks_db,
         query_param,
         chunks_vdb,
+        entity_profiles_storage=entity_profiles_storage,
+        entity_profiles_vdb=entity_profiles_vdb,
     )
 
     if context_result is None:
@@ -3947,6 +4133,8 @@ async def _perform_kg_search(
     text_chunks_db: BaseKVStorage,
     query_param: QueryParam,
     chunks_vdb: BaseVectorStorage = None,
+    entity_profiles_storage: BaseKVStorage | None = None,
+    entity_profiles_vdb: BaseVectorStorage | None = None,
 ) -> dict[str, Any]:
     """
     Pure search logic that retrieves raw entities, relations, and vector chunks.
@@ -4029,6 +4217,9 @@ async def _perform_kg_search(
             entities_vdb,
             query_param,
             query_embedding=ll_embedding,
+            entity_profiles_storage=entity_profiles_storage,
+            entity_profiles_vdb=entity_profiles_vdb,
+            apply_profiles=True,
         )
 
     elif query_param.mode == "global" and len(hl_keywords) > 0:
@@ -4048,6 +4239,9 @@ async def _perform_kg_search(
                 entities_vdb,
                 query_param,
                 query_embedding=ll_embedding,
+                entity_profiles_storage=entity_profiles_storage,
+                entity_profiles_vdb=entity_profiles_vdb,
+                apply_profiles=False,
             )
         if len(hl_keywords) > 0:
             global_relations, global_entities = await _get_edge_data(
@@ -4613,6 +4807,8 @@ async def _build_query_context(
     text_chunks_db: BaseKVStorage,
     query_param: QueryParam,
     chunks_vdb: BaseVectorStorage = None,
+    entity_profiles_storage: BaseKVStorage | None = None,
+    entity_profiles_vdb: BaseVectorStorage | None = None,
 ) -> QueryContextResult | None:
     """
     Main query context building function using the new 4-stage architecture:
@@ -4636,6 +4832,8 @@ async def _build_query_context(
         text_chunks_db,
         query_param,
         chunks_vdb,
+        entity_profiles_storage=entity_profiles_storage,
+        entity_profiles_vdb=entity_profiles_vdb,
     )
 
     if not search_result["final_entities"] and not search_result["final_relations"]:
@@ -4729,6 +4927,9 @@ async def _get_node_data(
     entities_vdb: BaseVectorStorage,
     query_param: QueryParam,
     query_embedding=None,
+    entity_profiles_storage: BaseKVStorage | None = None,
+    entity_profiles_vdb: BaseVectorStorage | None = None,
+    apply_profiles: bool = False,
 ):
     logger.info(
         f"Query nodes: {query} (top_k:{query_param.top_k}, cosine:{entities_vdb.cosine_better_than_threshold})"
@@ -4767,6 +4968,16 @@ async def _get_node_data(
         for k, n, d in zip(results, node_datas, node_degrees)
         if n is not None
     ]
+
+    if apply_profiles and query_param.enable_entity_profiles:
+        node_datas = await _select_profiles_for_entities(
+            query,
+            node_datas,
+            entity_profiles_storage,
+            entity_profiles_vdb,
+            query_param,
+            query_embedding=query_embedding,
+        )
 
     use_relations = await _find_most_related_edges_from_entities(
         node_datas,
